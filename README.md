@@ -1,31 +1,23 @@
-# Simulator Interface
+# ST Renderer
 
-Independent batched Fast Gauss rendering runtime. It has no EasyDrive import.
-
-The caller supplies a scene loader with two methods:
-
-```python
-loader.load_metadata(scene_id)
-loader.load_model(scene_id)  # returns a scene model
-```
-
-The returned scene model must provide `background`,
-`get_gaussian_attributes(...)`, and optionally `sky_cubemap(ray_d)`.
+Standalone StreetWorld renderer for trained Street Gaussian scenes. It has no
+EasyDrive import and exposes the interface StreetWorld already uses:
 
 ```python
-from simulator_interface import SimulatorInterface
+from st_renderer import SimulatorInterface
 
-simulator = SimulatorInterface(loader)
-metadata = simulator.load_metadata(scene_id)
-simulator.load_model(scene_id)
-simulator.update_scene(timestamp, object_poses)
-images = simulator.render(K, heights, widths, extrinsics)
+renderer = SimulatorInterface()
+renderer.load_metadata(scene_yaml)
+renderer.load_model(scene_yaml)
+renderer.update_scene(timestamp, object_poses)
+images = renderer.render(K, heights, widths, extrinsics)
 ```
 
-`K` has shape `[B, 3, 3]`, `extrinsics` has shape `[B, 4, 4]`, and
-`heights`/`widths` are Python lists. `render()` returns a uint8 ndarray with
-shape `[B, H, W, 3]`. CPU tensors are pinned and uploaded asynchronously;
-CUDA tensors are used directly.
+`K` is `[B, 3, 3]`, `extrinsics` is `[B, 4, 4]`, and `heights`/`widths` are
+Python lists. `render()` returns uint8 RGB `[B, H, W, 3]`.
 
-The runtime requires PyTorch and the local `fast_gauss` package from
-[`fast-gauss-paral`](../fast-gauss-paral).
+The scene YAML remains the source of scene data and checkpoints. Relative
+paths are resolved from the directory that contains its `configs/` tree.
+Runtime requirements outside this repository are the local `fast_gauss`,
+`mixplat`, and `nvdiffrast` CUDA packages; `trajdata` is only used for
+NuScenes maps.
