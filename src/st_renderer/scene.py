@@ -5,11 +5,8 @@ import math
 
 import torch
 from fast_gauss import BatchedGaussianRasterizer, GaussianRasterizationSettings
-from mixplat.cov_utils import compute_cov3d, compute_cov3d_conditional
-from mixplat.sh_utils import compute_sh, compute_sh_fourier
 
 from .gaussians import GaussianBackground, GaussianModelNonrigid, GaussianModelRigid, SkyCubeMap
-from .geometry import build_rotation
 
 
 def _raster_settings(camera, background):
@@ -25,15 +22,6 @@ def _raster_settings(camera, background):
         campos=camera["camera_center"],
         prefiltered=False,
     )
-
-
-def _eval_sh0_idft(sh, timestamp, degree_t, max_degree_t):
-    times = torch.as_tensor(timestamp, device="cuda", dtype=torch.float32).reshape(-1, 1)
-    indices = torch.arange(degree_t + 1, device="cuda")
-    basis = torch.empty((times.shape[0], degree_t + 1), device="cuda")
-    basis[:, indices % 2 == 0] = torch.cos(torch.pi * times * indices[indices % 2 == 0])
-    basis[:, indices % 2 == 1] = torch.sin(torch.pi * times * (indices[indices % 2 == 1] + 1))
-    return torch.cat((torch.sum(sh[:, : degree_t + 1, :] * basis[0, :, None], dim=1, keepdim=True), sh[:, max_degree_t + 1 :, :]), dim=1)
 
 
 class StreetGaussianScene:
@@ -97,138 +85,102 @@ class StreetGaussianScene:
                 offsets = json.load(file)
             for name, camera in self.camera_sensors.items():
                 camera.import_offset(offsets[name])
+        self._pack_gaussians()
 
-    def _object_attributes(self, timestamp, camera_center, extra_bboxes):
-        if isinstance(extra_bboxes, dict):
-            valid_gaussians = [gaussian for gaussian in self.object_gaussians if gaussian.id in extra_bboxes]
-        else:
-            valid_gaussians = [gaussian for gaussian in self.object_gaussians if gaussian.bounding_box.first_timestamp <= timestamp <= gaussian.bounding_box.last_timestamp]
-
-        rendered = valid_gaussians
-        rigid = {
-            "means3D": [torch.empty((0, 3), device="cuda")],
-            "opacities": [torch.empty((0, 1), device="cuda")],
-            "scales": [torch.empty((0, 3), device="cuda")],
-            "rotations": [torch.empty((0, 4), device="cuda")],
-            "shs": [torch.empty((0, (self.rigid_max_sh_degree + 1) ** 2 + self.rigid_max_sh_degree_t, 3), device="cuda")],
-            "object_rotations": [torch.empty((0, 4), device="cuda")],
-            "object_translations": [torch.empty((0, 3), device="cuda")],
-        }
-        nonrigid = {
-            "means3D": [torch.empty((0, 3), device="cuda")],
-            "opacities": [torch.empty((0, 1), device="cuda")],
-            "scales": [torch.empty((0, 3), device="cuda")],
-            "rotations": [torch.empty((0, 4), device="cuda")],
-            "shs": [torch.empty((0, (self.nonrigid_max_sh_degree + 1) ** 2 * (self.nonrigid_max_sh_degree_t + 1), 3), device="cuda")],
-            "ts": [torch.empty((0, 1), device="cuda")],
-            "scale_ts": [torch.empty((0, 1), device="cuda")],
-            "rotation_rs": [torch.empty((0, 4), device="cuda")],
-            "object_rotations": [torch.empty((0, 4), device="cuda")],
-            "object_translations": [torch.empty((0, 3), device="cuda")],
-        }
-        if isinstance(extra_bboxes, dict):
-            rigid["object_rotations"] = [torch.empty((0, 3, 3), device="cuda")]
-            nonrigid["object_rotations"] = [torch.empty((0, 3, 3), device="cuda")]
-        for gaussian in rendered:
-            if gaussian.amount == 0:
-                continue
-            target = rigid if gaussian.bounding_box.object_type == "rigid" else nonrigid
-            target["means3D"].append(gaussian.get_xyz())
-            target["opacities"].append(gaussian.get_opacity())
-            target["scales"].append(gaussian.get_scaling())
-            target["rotations"].append(gaussian.get_quaternion())
-            target["shs"].append(gaussian.get_features())
-            if gaussian.bounding_box.object_type == "nonrigid":
-                target["ts"].append(gaussian.get_t())
-                target["scale_ts"].append(gaussian.get_scaling_t())
-                target["rotation_rs"].append(gaussian.get_quaternion_r())
-            if isinstance(extra_bboxes, dict):
-                target["object_rotations"].append(extra_bboxes[gaussian.id][:3, :3].expand(gaussian.amount, 3, 3))
-                target["object_translations"].append(extra_bboxes[gaussian.id][:3, 3].expand(gaussian.amount, 3))
+    def _pack_gaussians(self):
+        gaussians = [self.bkgd_gaussians, *self.object_gaussians]
+        xyz = []
+        scales = []
+        rotations = []
+        opacities = []
+        ts = []
+        scale_ts = []
+        rotation_rs = []
+        gid_map = []
+        object_sources = torch.empty((len(self.object_gaussians), 2), device="cuda", dtype=torch.int32)
+        gid_start = 0
+        rigid_feature_start = 0
+        nonrigid_feature_start = 0
+        for object_id, gaussian in enumerate(gaussians):
+            amount = gaussian.amount
+            xyz.append(gaussian.get_xyz())
+            scales.append(gaussian.get_scaling())
+            rotations.append(gaussian.get_quaternion())
+            opacities.append(gaussian.get_opacity().reshape(-1))
+            mapping = torch.empty((amount, 2), device="cuda", dtype=torch.int32)
+            if gaussian is self.bkgd_gaussians:
+                mapping[:, 0] = 0
+                mapping[:, 1] = -1
+                ts.append(torch.zeros((amount,), device="cuda"))
+                scale_ts.append(torch.ones((amount,), device="cuda"))
+                rotation_rs.append(torch.zeros((amount, 4), device="cuda"))
+            elif isinstance(gaussian, GaussianModelRigid):
+                mapping[:, 0] = 1
+                mapping[:, 1] = object_id - 1
+                object_sources[object_id - 1, 0] = gid_start
+                object_sources[object_id - 1, 1] = rigid_feature_start
+                rigid_feature_start += amount
+                ts.append(torch.zeros((amount,), device="cuda"))
+                scale_ts.append(torch.ones((amount,), device="cuda"))
+                rotation_rs.append(torch.zeros((amount, 4), device="cuda"))
             else:
-                target["object_rotations"].append(gaussian.bounding_box.get_quaternion(timestamp).expand(gaussian.amount, 4))
-                target["object_translations"].append(gaussian.bounding_box.get_translation(timestamp).expand(gaussian.amount, 3))
+                mapping[:, 0] = 2
+                mapping[:, 1] = object_id - 1
+                object_sources[object_id - 1, 0] = gid_start
+                object_sources[object_id - 1, 1] = nonrigid_feature_start
+                nonrigid_feature_start += amount
+                ts.append(gaussian.get_t().reshape(-1))
+                scale_ts.append(gaussian.get_scaling_t().reshape(-1))
+                rotation_rs.append(gaussian.get_quaternion_r())
+            gid_map.append(mapping)
+            gid_start += amount
+        self._raw_gaussians = {
+            "xyz": torch.cat(xyz).contiguous(),
+            "scales": torch.cat(scales).contiguous(),
+            "rotations": torch.cat(rotations).contiguous(),
+            "opacities": torch.cat(opacities).contiguous(),
+            "background_features": self.bkgd_gaussians.get_features(),
+            "rigid_features": torch.cat([gaussian.get_features() for gaussian in self.rigid_gaussians]).contiguous() if self.rigid_gaussians else torch.empty((0, (self.rigid_max_sh_degree + 1) ** 2 + self.rigid_max_sh_degree_t, 3), device="cuda"),
+            "nonrigid_features": torch.cat([gaussian.get_features() for gaussian in self.nonrigid_gaussians]).contiguous() if self.nonrigid_gaussians else torch.empty((0, (self.nonrigid_max_sh_degree + 1) ** 2 * (self.nonrigid_max_sh_degree_t + 1), 3), device="cuda"),
+            "ts": torch.cat(ts).contiguous(),
+            "scale_ts": torch.cat(scale_ts).contiguous(),
+            "rotation_rs": torch.cat(rotation_rs).contiguous(),
+            "gid_map": torch.cat(gid_map).contiguous(),
+            "object_sources": object_sources,
+            "background_feature_stride": (self.bkgd_max_sh_degree + 1) ** 2,
+            "rigid_feature_stride": (self.rigid_max_sh_degree + 1) ** 2 + self.rigid_max_sh_degree_t,
+            "nonrigid_feature_stride": (self.nonrigid_max_sh_degree + 1) ** 2 * (self.nonrigid_max_sh_degree_t + 1),
+            "background_degree": self.bkgd_active_sh_degree,
+            "rigid_degree": self.rigid_active_sh_degree,
+            "rigid_degree_t": self.rigid_active_sh_degree_t,
+            "rigid_max_degree_t": self.rigid_max_sh_degree_t,
+            "nonrigid_degree": self.nonrigid_active_sh_degree,
+            "nonrigid_degree_t": self.nonrigid_active_sh_degree_t,
+        }
 
-        timestamp = (timestamp - self.timestamp_range[0]) / (self.timestamp_range[1] - self.timestamp_range[0])
-        for key in rigid:
-            rigid[key] = torch.cat(rigid[key], dim=0)
-        rigid["cov3ds"] = compute_cov3d(rigid["scales"], rigid["rotations"])
-        rigid["colors"] = compute_sh(
-            active_degree=self.rigid_active_sh_degree,
-            means3d=rigid["means3D"],
-            shs=_eval_sh0_idft(rigid["shs"], timestamp, self.rigid_active_sh_degree_t, self.rigid_max_sh_degree_t),
-            campos=camera_center,
-        )
-
-        for key in nonrigid:
-            nonrigid[key] = torch.cat(nonrigid[key], dim=0)
-        nonrigid["cov3ds"], covariance_t, speeds = compute_cov3d_conditional(nonrigid["scales"], nonrigid["scale_ts"], nonrigid["rotations"], nonrigid["rotation_rs"])
-        delta_t = timestamp - nonrigid["ts"]
-        nonrigid["opacities"] = nonrigid["opacities"] * torch.exp(-0.5 * delta_t * delta_t / covariance_t)
-        nonrigid["means3D"] = nonrigid["means3D"] + delta_t * speeds
-        nonrigid["colors"] = compute_sh_fourier(
-            self.nonrigid_active_sh_degree,
-            self.nonrigid_active_sh_degree_t,
-            means3d=nonrigid["means3D"],
-            mean_ts=nonrigid["ts"],
-            shs=nonrigid["shs"],
-            campos=camera_center,
-            timestamp=timestamp,
-            time_duration=1,
-        )
-
-        means = torch.cat((rigid["means3D"], nonrigid["means3D"]), dim=0)
-        opacities = torch.cat((rigid["opacities"], nonrigid["opacities"]), dim=0)
-        colors = torch.cat((rigid["colors"], nonrigid["colors"]), dim=0)
-        covariances = torch.cat((rigid["cov3ds"], nonrigid["cov3ds"]), dim=0)
-        rotations = torch.cat((rigid["object_rotations"], nonrigid["object_rotations"]), dim=0)
-        translations = torch.cat((rigid["object_translations"], nonrigid["object_translations"]), dim=0)
-        if rotations.shape[1] == 4:
-            rotations = build_rotation(rotations)
-        covariance_matrices = torch.zeros((covariances.shape[0], 3, 3), device="cuda")
-        covariance_matrices[:, 0, 0] = covariances[:, 0]
-        covariance_matrices[:, 0, 1] = covariance_matrices[:, 1, 0] = covariances[:, 1]
-        covariance_matrices[:, 0, 2] = covariance_matrices[:, 2, 0] = covariances[:, 2]
-        covariance_matrices[:, 1, 1] = covariances[:, 3]
-        covariance_matrices[:, 1, 2] = covariance_matrices[:, 2, 1] = covariances[:, 4]
-        covariance_matrices[:, 2, 2] = covariances[:, 5]
-        covariance_matrices = rotations @ covariance_matrices @ rotations.transpose(1, 2)
-        covariance_world = torch.stack((covariance_matrices[:, 0, 0], covariance_matrices[:, 0, 1], covariance_matrices[:, 0, 2], covariance_matrices[:, 1, 1], covariance_matrices[:, 1, 2], covariance_matrices[:, 2, 2]), dim=-1)
-        return (rotations @ means.unsqueeze(-1)).squeeze(-1) + translations, opacities, covariance_world, colors
-
-    def get_gaussian_attributes(self, timestamp, camera_center, full_proj_transform, visibility, extra_bboxes, **_):
-        means = [torch.empty((0, 3), device="cuda")]
-        opacities = [torch.empty((0, 1), device="cuda")]
-        covariances = [torch.empty((0, 6), device="cuda")]
-        colors = [torch.empty((0, 3), device="cuda")]
-        if "background" in visibility:
-            means.append(self.bkgd_gaussians.get_xyz())
-            opacities.append(self.bkgd_gaussians.get_opacity())
-            covariances.append(compute_cov3d(self.bkgd_gaussians.get_scaling(), self.bkgd_gaussians.get_quaternion()))
-            colors.append(compute_sh(self.bkgd_active_sh_degree, self.bkgd_gaussians.get_xyz(), self.bkgd_gaussians.get_features(), camera_center))
-        if "object" in visibility and self.is_dynamic:
-            object_means, object_opacities, object_covariances, object_colors = self._object_attributes(timestamp, camera_center, extra_bboxes)
-            means.append(object_means)
-            opacities.append(object_opacities)
-            covariances.append(object_covariances)
-            colors.append(object_colors)
-        return {"means3D": torch.cat(means), "opacities": torch.cat(opacities), "cov3ds": torch.cat(covariances), "colors": torch.cat(colors)}
+    def get_gaussian_attributes(self, timestamp, extra_bboxes):
+        object_count = len(self.object_gaussians)
+        object_poses = torch.empty((object_count, 4, 4), device="cuda")
+        object_active = torch.zeros((object_count,), device="cuda", dtype=torch.int32)
+        for object_id, gaussian in enumerate(self.object_gaussians):
+            if gaussian.id in extra_bboxes:
+                object_poses[object_id].copy_(extra_bboxes[gaussian.id])
+                object_active[object_id] = 1
+        return self._raw_gaussians | {
+            "object_poses": object_poses,
+            "object_active": object_active,
+            "timestamp": (timestamp - self.timestamp_range[0]) / (self.timestamp_range[1] - self.timestamp_range[0]),
+        }
 
     @torch.no_grad()
     def render_batch(self, timestamp, camera_params, ray_d, extra_bboxes):
-        attributes = [self.get_gaussian_attributes(timestamp=timestamp, visibility=("background", "object", "skymap"), extra_bboxes=extra_bboxes, **camera) for camera in camera_params]
+        raw = self.get_gaussian_attributes(timestamp, extra_bboxes)
         rasterizer = BatchedGaussianRasterizer(
             [_raster_settings(camera, self.background) for camera in camera_params],
-            init_buffer_size=len(attributes[0]["means3D"]),
+            init_buffer_size=raw["xyz"].shape[0],
             init_texture_size=[camera_params[0]["image_height"], camera_params[0]["image_width"]],
         )
-        rgb, alpha = rasterizer(
-            means3D=attributes[0]["means3D"],
-            means2D=None,
-            opacities=attributes[0]["opacities"],
-            colors_precomp=torch.stack([attribute["colors"] for attribute in attributes]),
-            cov3D_precomp=attributes[0]["cov3ds"],
-        )
+        rgb, alpha = rasterizer.render_street(raw)
         if hasattr(self, "sky_cubemap"):
             rgb = torch.lerp(self.sky_cubemap(ray_d), rgb, alpha)
         return rgb.detach().clamp(0, 1).mul(255).byte().permute(0, 2, 3, 1).cpu().numpy()

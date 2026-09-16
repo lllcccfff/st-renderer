@@ -5,7 +5,7 @@ import json
 import torch
 
 from .config import resolve_path
-from .geometry import gen_rays, get_fov, get_projection_matrix
+from .geometry import get_fov
 from .metadata import load_scene_metadata
 from .scene import StreetGaussianScene
 
@@ -21,6 +21,7 @@ class SimulatorInterface:
         self.scene_data = {}
         self.current_timestamp = None
         self.current_objects = {}
+        self._camera_rays = None
 
     def load_metadata(self, scene_id):
         scene_id = str(scene_id)
@@ -62,6 +63,7 @@ class SimulatorInterface:
             self.map_api = MapAPI(metadata.root / "data/.unified_data_cache")
 
     def load_model(self, scene_id):
+        self._camera_rays = None
         metadata = self.scene_data[str(scene_id)]
         self.scene_model = StreetGaussianScene(
             metadata.config.model_cfg,
@@ -88,26 +90,46 @@ class SimulatorInterface:
 
     def render(self, K, H, W, extrinsics):
         fovs = [get_fov(camera_K, height, width) for camera_K, height, width in zip(K, H, W)]
-        projections = [get_projection_matrix(camera_K, height, width, self.zNear, self.zFar) for camera_K, height, width in zip(K, H, W)]
         K = _cuda_async(K)
         w2c = _cuda_async(extrinsics).contiguous()
-        cameras = []
-        rays = []
-        for camera_K, camera_w2c, height, width, fov, projection in zip(K, w2c, H, W, fovs, projections):
-            projection = _cuda_async(projection)
-            cameras.append(
-                {
-                    "world_view_transform": camera_w2c.T,
-                    "full_proj_transform": (projection @ camera_w2c).contiguous().T,
-                    "camera_center": camera_w2c.inverse()[:3, 3].contiguous(),
-                    "image_height": height,
-                    "image_width": width,
-                    "FoVx": fov[0],
-                    "FoVy": fov[1],
-                }
+        widths = torch.as_tensor(W, dtype=K.dtype, device=K.device)
+        heights = torch.as_tensor(H, dtype=K.dtype, device=K.device)
+        projections = torch.zeros((len(H), 4, 4), dtype=K.dtype, device=K.device)
+        projections[:, 0, 0] = 2 * K[:, 0, 0] / widths
+        projections[:, 0, 1] = 2 * K[:, 0, 1] / widths
+        projections[:, 0, 2] = -1 + 2 * K[:, 0, 2] / widths
+        projections[:, 1, 1] = 2 * K[:, 1, 1] / heights
+        projections[:, 1, 2] = -1 + 2 * K[:, 1, 2] / heights
+        projections[:, 2, 2] = (self.zFar + self.zNear) / (self.zFar - self.zNear)
+        projections[:, 2, 3] = -2 * self.zFar * self.zNear / (self.zFar - self.zNear)
+        projections[:, 3, 2] = 1
+        height, width = H[0], W[0]
+        if self._camera_rays is None:
+            x, y = torch.meshgrid(
+                torch.arange(width, dtype=K.dtype, device=K.device),
+                torch.arange(height, dtype=K.dtype, device=K.device),
+                indexing="xy",
             )
-            rays.append(gen_rays(camera_w2c[:3, :3].T, camera_w2c[:3, 3], camera_K, height, width)[1])
-        return self.scene_model.render_batch(self.current_timestamp, cameras, torch.stack(rays), self.current_objects)
+            pixels = torch.stack((x + .5, y + .5, torch.ones_like(x)), dim=-1).reshape(1, -1, 3)
+            rays = pixels @ torch.linalg.inv(K).transpose(-1, -2)
+            self._camera_rays = rays / torch.norm(rays, dim=-1, keepdim=True)
+        rays = (self._camera_rays @ w2c[:, :3, :3]).reshape(len(H), height, width, 3)
+        world_view = w2c.transpose(-1, -2)
+        full_projection = (projections @ w2c).transpose(-1, -2).contiguous()
+        centers = torch.linalg.inv(w2c)[:, :3, 3].contiguous()
+        cameras = [
+            {
+                "world_view_transform": world_view[camera_id],
+                "full_proj_transform": full_projection[camera_id],
+                "camera_center": centers[camera_id],
+                "image_height": height,
+                "image_width": width,
+                "FoVx": fovs[camera_id][0],
+                "FoVy": fovs[camera_id][1],
+            }
+            for camera_id in range(len(H))
+        ]
+        return self.scene_model.render_batch(self.current_timestamp, cameras, rays, self.current_objects)
 
     @staticmethod
     def _parse_ego_pose_data(trajectory, start_timestamp, end_timestamp):

@@ -19,19 +19,19 @@ class GaussianModel:
         return self._xyz.shape[0]
 
     def get_scaling(self):
-        return torch.exp(self._scaling)
+        return self._scaling
 
     def get_quaternion(self):
-        return torch.nn.functional.normalize(self._rotation, dim=-1)
+        return self._rotation
 
     def get_xyz(self):
         return self._xyz
 
     def get_features(self):
-        return torch.cat((self._features_dc, self._features_rest), dim=1)
+        return self._features
 
     def get_opacity(self):
-        return torch.sigmoid(self._opacity)
+        return self._opacity
 
     def load_ply(self, path):
         ply = PlyData.read(path)
@@ -44,11 +44,13 @@ class GaussianModel:
         scale_names = sorted((item.name for item in vertex.properties if item.name.startswith("scale_")), key=lambda item: int(item.rsplit("_", 1)[1]))
         rotation_names = sorted((item.name for item in vertex.properties if item.name.startswith("rot")), key=lambda item: int(item.rsplit("_", 1)[1]))
         self._xyz = torch.tensor(xyz, dtype=torch.float32, device="cuda")
-        self._features_dc = torch.tensor(feature_dc, dtype=torch.float32, device="cuda").transpose(1, 2).contiguous()
-        self._features_rest = torch.tensor(feature_rest, dtype=torch.float32, device="cuda").transpose(1, 2).contiguous()
-        self._opacity = torch.tensor(opacity, dtype=torch.float32, device="cuda")
-        self._scaling = torch.tensor(np.stack([np.asarray(vertex[name]) for name in scale_names], axis=1), dtype=torch.float32, device="cuda")
-        self._rotation = torch.tensor(np.stack([np.asarray(vertex[name]) for name in rotation_names], axis=1), dtype=torch.float32, device="cuda")
+        self._features = torch.cat((
+            torch.tensor(feature_dc, dtype=torch.float32, device="cuda").transpose(1, 2),
+            torch.tensor(feature_rest, dtype=torch.float32, device="cuda").transpose(1, 2),
+        ), dim=1)
+        self._opacity = torch.sigmoid(torch.tensor(opacity, dtype=torch.float32, device="cuda"))
+        self._scaling = torch.exp(torch.tensor(np.stack([np.asarray(vertex[name]) for name in scale_names], axis=1), dtype=torch.float32, device="cuda"))
+        self._rotation = torch.nn.functional.normalize(torch.tensor(np.stack([np.asarray(vertex[name]) for name in rotation_names], axis=1), dtype=torch.float32, device="cuda"), dim=-1)
 
 
 class GaussianBackground(GaussianModel):
@@ -66,13 +68,12 @@ class GaussianObject(GaussianModel):
         return self.bounding_box.id
 
     def load(self, state):
-        self._xyz, self._features_dc, self._features_rest, self._scaling, self._rotation, self._opacity, self._semantic, self.max_radii2d, self.xyz_gradient_accum, self.denom, _, self.extent = state
-        self._xyz = _tensor(self._xyz)
-        self._features_dc = _tensor(self._features_dc)
-        self._features_rest = _tensor(self._features_rest)
-        self._scaling = _tensor(self._scaling)
-        self._rotation = _tensor(self._rotation)
-        self._opacity = _tensor(self._opacity)
+        xyz, feature_dc, feature_rest, scaling, rotation, opacity, self._semantic, self.max_radii2d, self.xyz_gradient_accum, self.denom, _, self.extent = state
+        self._xyz = _tensor(xyz)
+        self._features = torch.cat((_tensor(feature_dc), _tensor(feature_rest)), dim=1)
+        self._scaling = torch.exp(_tensor(scaling))
+        self._rotation = torch.nn.functional.normalize(_tensor(rotation), dim=-1)
+        self._opacity = torch.sigmoid(_tensor(opacity))
 
 
 class GaussianModelRigid(GaussianObject):
@@ -81,25 +82,24 @@ class GaussianModelRigid(GaussianObject):
 
 class GaussianModelNonrigid(GaussianObject):
     def load(self, state):
-        self._xyz, self._features_dc, self._features_rest, self._scaling, self._rotation, self._opacity, self._t, self._scaling_t, self._rotation_r, self._semantic, self.max_radii2d, self.xyz_gradient_accum, self.t_gradient_accum, self.denom, _, self.extent = state
-        self._xyz = _tensor(self._xyz)
-        self._features_dc = _tensor(self._features_dc)
-        self._features_rest = _tensor(self._features_rest)
-        self._scaling = _tensor(self._scaling)
-        self._rotation = _tensor(self._rotation)
-        self._opacity = _tensor(self._opacity)
-        self._t = _tensor(self._t)
-        self._scaling_t = _tensor(self._scaling_t)
-        self._rotation_r = _tensor(self._rotation_r)
+        xyz, feature_dc, feature_rest, scaling, rotation, opacity, t, scaling_t, rotation_r, self._semantic, self.max_radii2d, self.xyz_gradient_accum, self.t_gradient_accum, self.denom, _, self.extent = state
+        self._xyz = _tensor(xyz)
+        self._features = torch.cat((_tensor(feature_dc), _tensor(feature_rest)), dim=1)
+        self._scaling = torch.exp(_tensor(scaling))
+        self._rotation = torch.nn.functional.normalize(_tensor(rotation), dim=-1)
+        self._opacity = torch.sigmoid(_tensor(opacity))
+        self._t = _tensor(t)
+        self._scaling_t = torch.exp(_tensor(scaling_t))
+        self._rotation_r = torch.nn.functional.normalize(_tensor(rotation_r), dim=-1)
 
     def get_t(self):
         return self._t
 
     def get_scaling_t(self):
-        return torch.exp(self._scaling_t)
+        return self._scaling_t
 
     def get_quaternion_r(self):
-        return torch.nn.functional.normalize(self._rotation_r, dim=-1)
+        return self._rotation_r
 
 
 class SkyCubeMap(nn.Module):
