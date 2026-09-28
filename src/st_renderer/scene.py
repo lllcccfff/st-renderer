@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import math
 
 import torch
@@ -25,66 +24,45 @@ def _raster_settings(camera, background):
 
 
 class StreetGaussianScene:
-    def __init__(self, config, timestamp_range, cameras, bounding_boxes):
+    def __init__(self, timestamp_range, bounding_boxes):
         self.timestamp_range = timestamp_range
-        self.camera_sensors = cameras
-        self.bkgd_max_sh_degree = config.bkgd_gaussian_cfg.max_sh_degree
-        self.rigid_max_sh_degree = config.rigid_gaussian_cfg.max_sh_degree
-        self.rigid_max_sh_degree_t = config.rigid_gaussian_cfg.max_sh_degree_t
-        self.nonrigid_max_sh_degree = config.nonrigid_gaussian_cfg.max_sh_degree
-        self.nonrigid_max_sh_degree_t = config.nonrigid_gaussian_cfg.max_sh_degree_t
+        self.bkgd_max_sh_degree = 3
+        self.rigid_max_sh_degree = 1
+        self.rigid_max_sh_degree_t = 2
+        self.nonrigid_max_sh_degree = 1
+        self.nonrigid_max_sh_degree_t = 2
         self.bkgd_active_sh_degree = 0
         self.rigid_active_sh_degree = 0
         self.rigid_active_sh_degree_t = 0
         self.nonrigid_active_sh_degree = 0
         self.nonrigid_active_sh_degree_t = 0
-        self.background = torch.tensor(config.background, device="cuda", dtype=torch.float32)
-        self.sh_sigmoid_warmup = config.sh_sigmoid_warmup
-        self.is_dynamic = config.is_dynamic
+        self.background = torch.tensor((0, 0, 0), device="cuda", dtype=torch.float32)
 
         self.bkgd_gaussians = GaussianBackground(self.bkgd_max_sh_degree)
         self.rigid_gaussians = []
         self.nonrigid_gaussians = []
-        if self.is_dynamic:
-            for bounding_box in bounding_boxes.values():
-                if bounding_box.object_type == "rigid":
-                    self.rigid_gaussians.append(GaussianModelRigid(bounding_box, self.rigid_max_sh_degree, self.rigid_max_sh_degree_t))
-                elif bounding_box.object_type == "nonrigid":
-                    self.nonrigid_gaussians.append(GaussianModelNonrigid(bounding_box, self.nonrigid_max_sh_degree, self.nonrigid_max_sh_degree_t))
-        if not self.object_gaussians:
-            self.is_dynamic = False
-        if config.skymap_cfg.use_sky_cubemap:
-            self.sky_cubemap = SkyCubeMap(config.skymap_cfg.resolution)
+        for bounding_box in bounding_boxes.values():
+            if bounding_box.object_type == "rigid":
+                self.rigid_gaussians.append(GaussianModelRigid(bounding_box, self.rigid_max_sh_degree, self.rigid_max_sh_degree_t))
+            elif bounding_box.object_type == "nonrigid":
+                self.nonrigid_gaussians.append(GaussianModelNonrigid(bounding_box, self.nonrigid_max_sh_degree, self.nonrigid_max_sh_degree_t))
+        self.sky_cubemap = SkyCubeMap(1024)
 
     @property
     def object_gaussians(self):
         return self.rigid_gaussians + self.nonrigid_gaussians
 
-    def load_model(self, model_paths):
+    def load_model(self, background, objects, skymap):
         self.bkgd_active_sh_degree = self.bkgd_max_sh_degree
         self.rigid_active_sh_degree = self.rigid_max_sh_degree
         self.rigid_active_sh_degree_t = self.rigid_max_sh_degree_t
         self.nonrigid_active_sh_degree = self.nonrigid_max_sh_degree
         self.nonrigid_active_sh_degree_t = self.nonrigid_max_sh_degree_t
-        if model_paths.get("background_ply_path"):
-            self.bkgd_gaussians.load_ply(model_paths["background_ply_path"])
-        if model_paths.get("objects_pth_path"):
-            states = torch.load(model_paths["objects_pth_path"])
-            for gaussian, state in zip(self.object_gaussians, states):
-                gaussian.load(state)
-        if model_paths.get("sky_cubemap_path"):
-            self.sky_cubemap.load(torch.load(model_paths["sky_cubemap_path"]))
-        if model_paths.get("object_offset_path"):
-            with open(model_paths["object_offset_path"]) as file:
-                offsets = json.load(file)
-            for gaussian in self.object_gaussians:
-                if gaussian.id in offsets:
-                    gaussian.bounding_box.import_offset(offsets[gaussian.id])
-        if model_paths.get("camera_offset_path"):
-            with open(model_paths["camera_offset_path"]) as file:
-                offsets = json.load(file)
-            for name, camera in self.camera_sensors.items():
-                camera.import_offset(offsets[name])
+        self.bkgd_gaussians.load_ply(background)
+        states = torch.load(objects, map_location="cpu")
+        for gaussian, state in zip(self.object_gaussians, states):
+            gaussian.load(state)
+        self.sky_cubemap.load(torch.load(skymap, map_location="cpu"))
         self._pack_gaussians()
 
     def _pack_gaussians(self):

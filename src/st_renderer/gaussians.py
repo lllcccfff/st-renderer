@@ -33,8 +33,8 @@ class GaussianModel:
     def get_opacity(self):
         return self._opacity
 
-    def load_ply(self, path):
-        ply = PlyData.read(path)
+    def load_ply(self, source):
+        ply = PlyData.read(source)
         vertex = ply.elements[0]
         xyz = np.stack((np.asarray(vertex["x"]), np.asarray(vertex["y"]), np.asarray(vertex["z"])), axis=1)
         opacity = np.asarray(vertex["opacity"])[..., None]

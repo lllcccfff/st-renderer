@@ -1,13 +1,20 @@
 from __future__ import annotations
 
-import json
+import io
+from pathlib import Path
 
+import numpy as np
 import torch
 
-from .config import resolve_path
 from .geometry import get_fov
-from .metadata import load_scene_metadata
+from .metadata import load_json_member, load_scene_metadata, validate_archive_version
 from .scene import StreetGaussianScene
+
+
+_DEFAULT_ROOTS = {
+    "nuscenes": Path("data/processed/benchmark/nuscenes"),
+    "waymo": Path("data/processed/benchmark/waymo"),
+}
 
 
 def _cuda_async(tensor):
@@ -15,74 +22,83 @@ def _cuda_async(tensor):
 
 
 class SimulatorInterface:
-    def __init__(self, zNear=0.0001, zFar=1000):
+    def __init__(
+        self,
+        dataset,
+        root=None,
+        zNear=0.0001,
+        zFar=1000,
+    ):
+        self.dataset = dataset
+        self.root = Path(_DEFAULT_ROOTS[dataset] if root is None else root).expanduser().resolve()
         self.zNear = zNear
         self.zFar = zFar
         self.scene_data = {}
+        self._maps = {}
         self.current_timestamp = None
         self.current_objects = {}
         self._camera_rays = None
 
-    def load_metadata(self, scene_id):
-        scene_id = str(scene_id)
-        metadata = load_scene_metadata(scene_id)
-        self.scene_data[scene_id] = metadata
-        config = metadata.config
-        model_paths = config.visualizer_cfg.model_path
+    def _scene_path(self, scene_name):
+        return self.root / f"{scene_name}.npz"
+
+    def load_metadata(self, scene_name):
+        scene_name = str(scene_name)
+        metadata = load_scene_metadata(self._scene_path(scene_name))
+        self.scene_data[scene_name] = metadata
         trackings = metadata.bounding_boxes | metadata.static_bounding_boxes
-        tracking_data = self._parse_tracking_data(trackings, metadata.timestamp_range[0], resolve_path(metadata.root, model_paths.get("object_offset_path")))
-        background_mesh = resolve_path(metadata.root, config.dataloader_cfg.dataset_cfg.data_dir) / "background.obj"
-        if not background_mesh.exists():
-            background_mesh = None
-        if "hd_map" in config.dataloader_cfg and str(config.dataloader_cfg.hd_map.map_type).lower() == "nuscenes":
-            self._load_map(scene_id, metadata)
+        ground = self.root / "ground" / f"{scene_name}.obj" if self.dataset == "waymo" else None
         return (
             list(metadata.timestamp_range),
-            self._parse_camera_data(metadata.cameras, metadata.ego_poses, metadata.timestamp_range[0]),
+            metadata.cameras,
             self._parse_ego_pose_data(metadata.ego_poses, *metadata.timestamp_range),
-            tracking_data,
-            str(background_mesh) if background_mesh else None,
+            self._parse_tracking_data(trackings),
+            str(ground) if ground is not None else None,
             None,
         )
 
-    def _load_map(self, scene_id, metadata):
-        from trajdata.maps import MapAPI
-
-        hd_map = metadata.config.dataloader_cfg.hd_map
-        version = getattr(hd_map, "nuscene_version", "v1.0-trainval")
-        nuscene_root = resolve_path(metadata.root, hd_map.nuscene_root)
-        table_dir = nuscene_root / version
-        scenes = json.loads((table_dir / "scene.json").read_text())
-        logs = json.loads((table_dir / "log.json").read_text())
-        scene_name = str(metadata.config.dataloader_cfg.dataset_cfg.scene_name)
-        nuscene_id = "scene-" + scene_name.rsplit("_", 1)[0]
-        scene = {item["name"]: item for item in scenes}[nuscene_id]
-        location = {item["token"]: item for item in logs}[scene["log_token"]]["location"]
-        self.scene_data[scene_id].map_name = f"nusc_{version.split('-')[1]}:{location}"
-        if not hasattr(self, "map_api"):
-            self.map_api = MapAPI(metadata.root / "data/.unified_data_cache")
-
-    def load_model(self, scene_id):
+    def load_model(self, scene_name):
+        scene_name = str(scene_name)
         self._camera_rays = None
-        metadata = self.scene_data[str(scene_id)]
-        self.scene_model = StreetGaussianScene(
-            metadata.config.model_cfg,
-            metadata.timestamp_range,
-            metadata.cameras,
-            metadata.bounding_boxes,
+        metadata = self.scene_data[scene_name]
+        with np.load(self._scene_path(scene_name), allow_pickle=False) as archive:
+            validate_archive_version(archive)
+            background = io.BytesIO(archive["background"].tobytes())
+            objects = io.BytesIO(archive["objects"].tobytes())
+            skymap = io.BytesIO(archive["skymap"].tobytes())
+
+        self.scene_model = StreetGaussianScene(metadata.timestamp_range, metadata.bounding_boxes)
+        self.scene_model.load_model(background, objects, skymap)
+        if metadata.map_id is None:
+            return None
+        return self._load_map(metadata.map_id)
+
+    def _load_map(self, map_id):
+        if map_id in self._maps:
+            return self._maps[map_id]
+
+        from trajdata.maps.vec_map import VectorMap
+        from trajdata.proto.vectorized_map_pb2 import VectorizedMap
+
+        with np.load(self.root / "map_cache.npz", allow_pickle=False) as archive:
+            validate_archive_version(archive)
+            manifest = load_json_member(archive, "manifest")
+            map_key = manifest[map_id]
+            payload = archive[map_key].tobytes()
+
+        proto = VectorizedMap()
+        proto.ParseFromString(payload)
+        vector_map = VectorMap.from_proto(
+            proto,
+            incl_road_lanes=True,
+            incl_road_areas=True,
+            incl_roads=True,
+            incl_ped_crosswalks=True,
+            incl_ped_walkways=True,
         )
-        self.scene_model.load_model(
-            {key: resolve_path(metadata.root, value) for key, value in metadata.config.visualizer_cfg.model_path.items()}
-        )
-        if hasattr(self, "map_api"):
-            return self.map_api.get_map(
-                metadata.map_name,
-                incl_centerline=True,
-                incl_lane_edges=True,
-                incl_lane_area=True,
-                incl_ped_crosswalks=True,
-                incl_ped_walkways=True,
-            )
+        vector_map.compute_search_indices()
+        self._maps[map_id] = vector_map
+        return vector_map
 
     def update_scene(self, timestamp, object_poses):
         self.current_timestamp = timestamp
@@ -140,32 +156,21 @@ class SimulatorInterface:
         }
 
     @staticmethod
-    def _parse_camera_data(cameras, ego_poses, _):
-        parsed = {}
-        for name, camera in cameras.items():
-            timestamp = next(iter(camera.world_view_transform))
-            ego2world = ego_poses.get_transform(timestamp).cuda(non_blocking=True)
-            parsed[name] = {
-                "K": camera.K.tolist(),
-                "H": camera.image_height,
-                "W": camera.image_width,
-                "ego2camera": (camera.world_view_transform[timestamp].T @ ego2world).tolist(),
-            }
-        return parsed
-
-    @staticmethod
-    def _parse_tracking_data(trackings, _, object_offset_path):
-        if object_offset_path and object_offset_path.exists():
-            with object_offset_path.open() as file:
-                offsets = json.load(file)
-            for identifier, tracking in trackings.items():
-                if identifier in offsets:
-                    tracking.import_offset(offsets[identifier])
-        parsed = {}
-        for identifier, tracking in trackings.items():
-            parsed[identifier] = {
-                "poses": {timestamp: tracking.get_transform(timestamp).tolist() for timestamp in tracking.get_sorted_ts()},
+    def _parse_tracking_data(trackings):
+        return {
+            identifier: {
+                "poses": {
+                    timestamp: tracking.get_transform(timestamp).tolist()
+                    for timestamp in tracking.get_sorted_ts()
+                },
                 "size": tracking.size.tolist(),
-                "type": "vehicle" if tracking.detail_type == "rigid" else "pedestrian" if tracking.detail_type == "nonrigid" else tracking.detail_type,
+                "type": (
+                    "vehicle"
+                    if tracking.detail_type == "rigid"
+                    else "pedestrian"
+                    if tracking.detail_type == "nonrigid"
+                    else tracking.detail_type
+                ),
             }
-        return parsed
+            for identifier, tracking in trackings.items()
+        }
