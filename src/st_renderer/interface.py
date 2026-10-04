@@ -104,6 +104,14 @@ class SimulatorInterface:
         self.current_timestamp = timestamp
         self.current_objects = {identifier: _cuda_async(pose) for identifier, pose in object_poses.items()}
 
+    def close(self):
+        import fast_gauss
+
+        fast_gauss.close()
+        self.scene_model = None
+        self.current_objects = {}
+        self._camera_rays = None
+
     def render(self, K, H, W, extrinsics):
         fovs = [get_fov(camera_K, height, width) for camera_K, height, width in zip(K, H, W)]
         K = _cuda_async(K)

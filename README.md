@@ -11,10 +11,16 @@ renderer.load_metadata(scene_name)
 renderer.load_model(scene_name)
 renderer.update_scene(timestamp, object_poses)
 images = renderer.render(K, heights, widths, extrinsics)
+renderer.close()
 ```
 
 `K` is `[B, 3, 3]`, `extrinsics` is `[B, 4, 4]`, and `heights`/`widths` are
 Python lists. `render()` returns uint8 RGB `[B, H, W, 3]`.
+
+Fast Gauss initializes OpenGL on the first render. Run all rendering and
+`close()` on the same thread; importing the renderer does not create an OpenGL
+context. Reuse that thread across scene resets so the context and render buffers
+can be reused. `close()` releases Fast Gauss resources and its owned EGL context.
 
 `scene_name` is a four-digit NuScenes name or a Waymo name such as
 `001-segment-1422926405879888210`. Scene metadata and model data are loaded
