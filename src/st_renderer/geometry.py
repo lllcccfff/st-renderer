@@ -49,11 +49,14 @@ def build_rotation(quaternion):
 
 
 def slerp(first, second, ratio):
-    first_norm = first / torch.norm(first, dim=-1, keepdim=True)
-    second_norm = second / torch.norm(second, dim=-1, keepdim=True)
-    dot = (first_norm * second_norm).sum(-1)
-    if torch.abs(dot) > 0.9995:
-        return (1 - ratio) * first + ratio * second
+    first = first / torch.norm(first, dim=-1, keepdim=True)
+    second = second / torch.norm(second, dim=-1, keepdim=True)
+    dot = (first * second).sum(-1)
+    if dot < 0:
+        second = -second
+        dot = -dot
+    if dot > 0.9995:
+        return functional.normalize((1 - ratio) * first + ratio * second, dim=-1)
     theta = torch.acos(dot)
     return (torch.sin(theta * (1 - ratio)) / torch.sin(theta)) * first + (torch.sin(theta * ratio) / torch.sin(theta)) * second
 

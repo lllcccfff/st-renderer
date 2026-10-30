@@ -59,10 +59,10 @@ class StreetGaussianScene:
         self.nonrigid_active_sh_degree = self.nonrigid_max_sh_degree
         self.nonrigid_active_sh_degree_t = self.nonrigid_max_sh_degree_t
         self.bkgd_gaussians.load_ply(background)
-        states = torch.load(objects, map_location="cpu")
+        states = torch.load(objects, map_location="cpu", weights_only=False)
         for gaussian, state in zip(self.object_gaussians, states):
             gaussian.load(state)
-        self.sky_cubemap.load(torch.load(skymap, map_location="cpu"))
+        self.sky_cubemap.load(torch.load(skymap, map_location="cpu", weights_only=False))
         self._pack_gaussians()
 
     def _pack_gaussians(self):
@@ -135,6 +135,9 @@ class StreetGaussianScene:
             "nonrigid_degree": self.nonrigid_active_sh_degree,
             "nonrigid_degree_t": self.nonrigid_active_sh_degree_t,
         }
+        from fast_gauss.street_pipeline import initialize_world
+
+        initialize_world(self._raw_gaussians, self.bkgd_gaussians.amount)
 
     def get_gaussian_attributes(self, timestamp, extra_bboxes):
         object_count = len(self.object_gaussians)
@@ -157,8 +160,13 @@ class StreetGaussianScene:
             [_raster_settings(camera, self.background) for camera in camera_params],
             init_buffer_size=raw["xyz"].shape[0],
             init_texture_size=[camera_params[0]["image_height"], camera_params[0]["image_width"]],
+            tex_dtype=torch.float16,
         )
         rgb, alpha = rasterizer.render_street(raw)
         if hasattr(self, "sky_cubemap"):
             rgb = torch.lerp(self.sky_cubemap(ray_d), rgb, alpha)
-        return rgb.detach().clamp(0, 1).mul(255).byte().permute(0, 2, 3, 1).cpu().numpy()
+        image = rgb.detach().clamp(0, 1).mul(255).byte().permute(0, 2, 3, 1)
+        host_image = torch.empty_like(image, device="cpu", pin_memory=True)
+        host_image.copy_(image, non_blocking=True)
+        torch.cuda.current_stream().synchronize()
+        return host_image.numpy()

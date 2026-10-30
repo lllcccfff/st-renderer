@@ -12,8 +12,8 @@ from .scene import StreetGaussianScene
 
 
 _DEFAULT_ROOTS = {
-    "nuscenes": Path("data/processed/benchmark/nuscenes"),
-    "waymo": Path("data/processed/benchmark/waymo"),
+    "nuscenes": Path("data/benchmark/nuscenes"),
+    "waymo": Path("data/benchmark/waymo"),
 }
 
 
@@ -37,7 +37,7 @@ class SimulatorInterface:
         self._maps = {}
         self.current_timestamp = None
         self.current_objects = {}
-        self._camera_rays = None
+        self._camera_parameters = None
 
     def _scene_path(self, scene_name):
         return self.root / f"{scene_name}.npz"
@@ -59,7 +59,7 @@ class SimulatorInterface:
 
     def load_model(self, scene_name):
         scene_name = str(scene_name)
-        self._camera_rays = None
+        self._camera_parameters = None
         metadata = self.scene_data[scene_name]
         with np.load(self._scene_path(scene_name), allow_pickle=False) as archive:
             validate_archive_version(archive)
@@ -110,12 +110,11 @@ class SimulatorInterface:
         fast_gauss.close()
         self.scene_model = None
         self.current_objects = {}
-        self._camera_rays = None
+        self._camera_parameters = None
 
-    def render(self, K, H, W, extrinsics):
+    def _init_camera_parameters(self, K, H, W):
         fovs = [get_fov(camera_K, height, width) for camera_K, height, width in zip(K, H, W)]
         K = _cuda_async(K)
-        w2c = _cuda_async(extrinsics).contiguous()
         widths = torch.as_tensor(W, dtype=K.dtype, device=K.device)
         heights = torch.as_tensor(H, dtype=K.dtype, device=K.device)
         projections = torch.zeros((len(H), 4, 4), dtype=K.dtype, device=K.device)
@@ -128,16 +127,23 @@ class SimulatorInterface:
         projections[:, 2, 3] = -2 * self.zFar * self.zNear / (self.zFar - self.zNear)
         projections[:, 3, 2] = 1
         height, width = H[0], W[0]
-        if self._camera_rays is None:
-            x, y = torch.meshgrid(
-                torch.arange(width, dtype=K.dtype, device=K.device),
-                torch.arange(height, dtype=K.dtype, device=K.device),
-                indexing="xy",
-            )
-            pixels = torch.stack((x + .5, y + .5, torch.ones_like(x)), dim=-1).reshape(1, -1, 3)
-            rays = pixels @ torch.linalg.inv(K).transpose(-1, -2)
-            self._camera_rays = rays / torch.norm(rays, dim=-1, keepdim=True)
-        rays = (self._camera_rays @ w2c[:, :3, :3]).reshape(len(H), height, width, 3)
+        x, y = torch.meshgrid(
+            torch.arange(width, dtype=K.dtype, device=K.device),
+            torch.arange(height, dtype=K.dtype, device=K.device),
+            indexing="xy",
+        )
+        pixels = torch.stack((x + .5, y + .5, torch.ones_like(x)), dim=-1).reshape(1, -1, 3)
+        rays = pixels @ torch.linalg.inv(K).transpose(-1, -2)
+        self._camera_parameters = projections, rays / torch.norm(rays, dim=-1, keepdim=True), fovs
+
+    def render(self, K, H, W, extrinsics):
+        # Intrinsics are fixed for the loaded camera rig, like its pixel rays.
+        if self._camera_parameters is None:
+            self._init_camera_parameters(K, H, W)
+        projections, camera_rays, fovs = self._camera_parameters
+        w2c = _cuda_async(extrinsics).contiguous()
+        height, width = H[0], W[0]
+        rays = (camera_rays @ w2c[:, :3, :3]).reshape(len(H), height, width, 3)
         world_view = w2c.transpose(-1, -2)
         full_projection = (projections @ w2c).transpose(-1, -2).contiguous()
         centers = torch.linalg.inv(w2c)[:, :3, 3].contiguous()
